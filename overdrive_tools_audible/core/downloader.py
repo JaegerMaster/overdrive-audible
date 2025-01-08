@@ -12,22 +12,44 @@ from . import utils
 
 console = Console()
 
-def get_metadata_info(metadata_path: str) -> dict:
-    """Extract author and title from the metadata file."""
-    with open(metadata_path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f.readlines() if line.strip()]
-    
-    return {
-        "title": lines[2],  # Title is on the third non-empty line
-        "author": lines[6]  # Author is on the seventh non-empty line
-    }
-
 class OverDriveDownloader:
     def __init__(self, odm_path: str):
         """Initialize OverDrive downloader with ODM file path."""
         self.odm_path = odm_path
         self.metadata_path = f"{odm_path}.metadata"
         self.license_path = f"{odm_path}.license"
+        
+    def extract_metadata(self) -> None:
+        """Extract metadata from ODM file."""
+        if os.path.exists(self.metadata_path) and utils.get_file_size(self.metadata_path) > 0:
+            return
+
+        try:
+            with open(self.odm_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            metadata_text = "Metadata>"
+            metadata_start = content.find("<" + metadata_text)
+            metadata_end = content.find("</" + metadata_text) + len("</" + metadata_text)
+            
+            if metadata_start == -1 or metadata_end == -1:
+                cdata_start = content.find("<![CDATA[<" + metadata_text)
+                if cdata_start != -1:
+                    metadata_start = cdata_start + 9
+                    cdata_end = content.find("]]>", metadata_start)
+                    if cdata_end != -1:
+                        metadata_end = cdata_end
+            
+            if metadata_start == -1 or metadata_end == -1:
+                raise ValueError("Could not find Metadata section in ODM file")
+                
+            metadata = content[metadata_start:metadata_end]
+            
+            with open(self.metadata_path, 'w', encoding='utf-8') as f:
+                f.write(metadata)
+                
+        except Exception as e:
+            raise Exception(f"Error extracting metadata: {str(e)}")
 
     def acquire_license(self) -> None:
         """Acquire license from OverDrive server."""
@@ -76,26 +98,21 @@ class OverDriveDownloader:
                     progress.update(task_id, completed=(downloaded / total_size) * 100)
 
     def download(self) -> str:
-        """Download all parts of the audiobook using existing metadata file."""
-        # Verify metadata file exists
-        if not os.path.exists(self.metadata_path):
-            raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
+        """Download all parts of the audiobook and return the output directory."""
+        self.extract_metadata()
+        self.acquire_license()
         
-        # Get author and title from metadata
-        info = get_metadata_info(self.metadata_path)
+        info = utils.get_metadata_info(self.metadata_path)
         author, title = info["author"], info["title"]
         
-        # Create output directory
         output_dir = Config.DIR_FORMAT.replace("@AUTHOR", author).replace("@TITLE", title)
         utils.ensure_dir_exists(output_dir)
 
-        # Get license content
         with open(self.license_path) as f:
             license_content = f.read().strip()
         root = ET.fromstring(license_content)
         client_id = root.find(".//{*}ClientID").text
 
-        # Parse ODM file for download information
         odm_tree = ET.parse(self.odm_path)
         odm_root = odm_tree.getroot()
         base_url = odm_root.find(".//Protocol[@method='download']").get("baseurl")
@@ -137,10 +154,35 @@ class OverDriveDownloader:
                     task_id
                 )
 
+        # Download cover image
+        self._download_cover(output_dir)
+        
         # Create chapters.txt
         self._create_chapters_file(output_dir, parts)
 
         return output_dir
+
+    def _download_cover(self, output_dir: str) -> None:
+        """Download cover image if available."""
+        try:
+            metadata_tree = ET.parse(self.metadata_path)
+            metadata_root = metadata_tree.getroot()
+            cover_url = metadata_root.find(".//CoverUrl")
+            
+            if cover_url is not None and cover_url.text:
+                cover_url_text = cover_url.text.replace("{", "%7B").replace("}", "%7D")
+                cover_path = os.path.join(output_dir, "folder.jpg")
+                
+                response = requests.get(
+                    cover_url_text,
+                    headers={"User-Agent": Config.USER_AGENT}
+                )
+                response.raise_for_status()
+                
+                with open(cover_path, 'wb') as f:
+                    f.write(response.content)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not download cover image: {str(e)}[/yellow]")
 
     def _create_chapters_file(self, output_dir: str, parts: list) -> None:
         """Create chapters.txt file."""
